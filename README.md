@@ -1,10 +1,11 @@
-# Jev Guard
 # Windows Process Monitor (Jev-powered)
 
 Watches for new processes on Windows in real time, sends each one to
 TypeSafe's Jev model for a fast risk classification, logs everything to a
-local SQLite database, and shows a live dashboard. Log/alert only — it never
-kills a process or blocks anything.
+local SQLite database, and shows a live dashboard. By default it only logs
+and alerts — killing a process is always explicit: either `AUTO_BLOCK=1`
+for very-high-confidence verdicts, or you clicking **Block** in the
+dashboard.
 
 ## Setup
 
@@ -23,60 +24,95 @@ kills a process or blocks anything.
    (open a new terminal after `setx`, or use `$env:TYPESAFE_API_KEY="..."` for
    the current PowerShell session only)
 
+   Alternatively, put the key in a `.env` file in this folder
+   (`TYPESAFE_API_KEY=your-key-here`) — `monitor.py` and `jev_demo.py` load it
+   automatically at startup, so no `setx` step is needed.
+
 ## Run
 
-Open **one terminal as Administrator** and run:
-
-```
-python dashboard.py
-```
-
-This automatically starts `monitor.py` in the background. Open
-http://127.0.0.1:8787 in a browser — the dashboard live-refreshes every 5s.
-Press **Ctrl+C** to stop both the dashboard and the monitor.
-
-### Standalone monitor
-
-If you prefer to run the monitor separately (e.g. without the dashboard):
+Open two terminals (both as Administrator for the monitor):
 
 ```
 python monitor.py
 ```
-
-## Dashboard
-
-The dashboard is a single-page interactive UI with:
-
-- **Stats cards** — live counts for total events, alerts, suspicious,
-  malicious, benign, and classified processes
-- **Risk filter buttons** — click to show only Alerts / Malicious /
-  Suspicious / Benign / Errors
-- **Search** — live search across process name, path, and command line
-- **Dark theme** with color-coded risk badges and hover highlights
-
-Data is served via JSON API endpoints (`/api/stats`, `/api/events`) so
-filtering and search are instant client-side.
-
-## Jev Demo
-
-To test the Jev classification API against sample processes without running
-the full monitor:
-
 ```
-python jev_demo.py
+python dashboard.py
 ```
 
-This sends 8 sample process launches (benign, suspicious, malicious) to the
-Jev API and prints a formatted report with risk badges, confidence scores,
-reasons, and full JSON responses.
+Then open http://127.0.0.1:8787 in a browser. It auto-refreshes every 5s.
+
+An `events.db` created by an older version of the project is migrated
+automatically the first time the monitor or dashboard opens it — new
+columns are added in place and existing history is kept.
+
+## Tests
+
+`test_monitor.py` covers the whole auto-block path — the confidence math,
+the protected list, and real WMI termination. Run it either way:
+
+```
+python test_monitor.py
+```
+```
+pytest test_monitor.py
+```
+
+15 tests, about 15 seconds. What it proves:
+
+- **≥ 90% + `AUTO_BLOCK=1` really kills**: `resolve_action()` — the exact
+  function `monitor.main()` runs — terminates a live process at exactly
+  90% and at 91%, and leaves an 89% one alone as `pending`.
+- **Protected names are never killed**, even at 99% confidence.
+- **End-to-end**: the real `monitor.main()` watch loop runs in a driver
+  subprocess (auto-block on, isolated temp database, Jev stubbed to return
+  malicious @ 95% for one uniquely marked process) and must classify and
+  terminate that process on its own, logging `action_taken='blocked'`.
+
+The tests only ever terminate sleeping Python subprocesses they spawn
+themselves, write end-to-end data to a temporary database (your real
+`events.db` is untouched), and patch `AUTO_BLOCK` only in-process — your
+environment is not modified. Expect a single desktop toast during the
+end-to-end run: that's the victim being alerted.
+
+## How blocking works
+
+Every new process gets three answers from Jev: `risk`, `reason`, and a
+suggested `action` (allow / monitor / block). What happens next depends on
+confidence:
+
+- **Very high confidence** (≥90%) `malicious` + `block`, **and**
+  `AUTO_BLOCK=1` is set: terminated immediately, no confirmation needed.
+- **Anything else Jev suggests blocking**: queued as "pending" — you get a
+  toast notification and an entry in the dashboard's **Pending approval**
+  section with **Block** / **Dismiss** buttons. Clicking one writes your
+  decision to the database; `monitor.py` picks it up (checked roughly once
+  a second) and either terminates the process or marks it dismissed.
+- **Protected processes** (`NEVER_BLOCK_NAMES` — svchost, lsass, explorer,
+  etc.) are never auto-blocked no matter what Jev says or how confident it
+  is. If Jev flags one as malicious it still goes to pending approval, but
+  you'd be blocking it yourself, deliberately, with full knowledge of the
+  risk.
+- **Toast threshold**: desktop notifications only fire when the result is
+  `suspicious`/`malicious` **and** confidence is above 60%
+  (`ALERT_CONFIDENCE_THRESHOLD` in `monitor.py`). Anything below that is
+  still logged to the database and shown in the dashboard, just without a
+  pop-up.
+
+`AUTO_BLOCK` is off by default — with it off, *everything* Jev suggests
+blocking goes to pending approval, so nothing gets killed without you
+clicking a button. Turn it on with:
+```
+setx AUTO_BLOCK "1"
+```
 
 ## How it decides what's suspicious
 
 Every new process is described (name, path, command line, parent process)
-and sent to Jev with two questions:
+and sent to Jev with three questions:
 - `risk`: benign / suspicious / malicious
 - `reason`: normal_operation / unusual_location / spoofed_system_name /
   script_or_interpreter_abuse / persistence_mechanism / unknown
+- `action`: allow / monitor / block (drives the blocking behavior above)
 
 A small allowlist skips classification for common system processes
 (`svchost.exe`, `explorer.exe`, etc.) **only** when they're running from
@@ -86,6 +122,14 @@ exact names from other folders, so name alone never skips a check.
 ## Tuning it for your environment
 
 This is a starting point, not a finished detector. Things worth adding:
+
+- **Windows toast action buttons**: right now the toast just opens the
+  dashboard on click; `win10toast_click` doesn't support multiple buttons
+  with separate callbacks. For true in-toast Block/Dismiss buttons you'd
+  need a Windows Runtime toast library (e.g. `windows-toasts`) with
+  `ToastActivatedEventArgs`. The `WNDPROC ... TypeError` noise it prints on
+  newer Python/Windows comes from the same library's message pump —
+  harmless, and another reason to switch.
 
 - **Expand the allowlist** with your own known-good software (browsers, IDEs,
   build tools) so you're not paying for/alerting on things you already trust.

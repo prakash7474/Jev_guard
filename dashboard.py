@@ -1,455 +1,240 @@
 """
-Local read-only dashboard for the process monitor.
+Local dashboard for the process monitor.
 
-Serves a modern, interactive dashboard at http://127.0.0.1:8787 with:
-- Live stats cards (total events, alerts, threat breakdowns)
-- Risk-level filter buttons
-- Process name search
-- Client-side filtering with a JSON API
-- Auto-refresh every 5 seconds
-
-Run alongside monitor.py.
+Serves an auto-refreshing page at http://127.0.0.1:8787 showing pending
+block approvals, recent alerts, and the full event log from events.db.
+Run this alongside monitor.py - monitor.py polls the same DB and acts on
+any decision you make here (Block / Dismiss) within about a second.
 """
 
-import json
+import html
 import os
-import signal
 import sqlite3
-import subprocess
-import sys
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.parse import urlparse, parse_qs
-
-from dotenv import load_dotenv
-
-load_dotenv()
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "events.db")
 PORT = 8787
 
-
-# ---------------------------------------------------------------------------
-# Data access
-# ---------------------------------------------------------------------------
-
-def get_stats():
-    if not os.path.exists(DB_PATH):
-        return {"total": 0, "alerts": 0, "suspicious": 0, "malicious": 0,
-                "benign": 0, "error": 0, "classified": 0}
-    conn = sqlite3.connect(DB_PATH)
-    row = conn.execute(
-        """SELECT
-             COUNT(*) AS total,
-             SUM(CASE WHEN risk IN ('suspicious','malicious') THEN 1 ELSE 0 END) AS alerts,
-             SUM(CASE WHEN risk='suspicious' THEN 1 ELSE 0 END) AS suspicious,
-             SUM(CASE WHEN risk='malicious' THEN 1 ELSE 0 END) AS malicious,
-             SUM(CASE WHEN risk='benign' THEN 1 ELSE 0 END) AS benign,
-             SUM(CASE WHEN risk='error' THEN 1 ELSE 0 END) AS error,
-             SUM(CASE WHEN classified=1 THEN 1 ELSE 0 END) AS classified
-           FROM events"""
-    ).fetchone()
-    conn.close()
-    keys = ["total", "alerts", "suspicious", "malicious", "benign", "error", "classified"]
-    return {k: (v or 0) for k, v in zip(keys, row)}
-
-
-def get_events(limit=500, risk=None, search=None):
-    if not os.path.exists(DB_PATH):
-        return []
-    conn = sqlite3.connect(DB_PATH)
-    query = "SELECT * FROM events"
-    params = []
-    clauses = []
-    if risk:
-        if risk == "alerts":
-            clauses.append("risk IN ('suspicious','malicious')")
-        elif risk in ("benign", "error"):
-            clauses.append("risk = ?")
-            params.append(risk)
-        else:
-            clauses.append("risk = ?")
-            params.append(risk)
-    if search:
-        clauses.append("(name LIKE ? OR path LIKE ? OR command_line LIKE ?)")
-        term = f"%{search}%"
-        params.extend([term, term, term])
-    if clauses:
-        query += " WHERE " + " AND ".join(clauses)
-    query += " ORDER BY id DESC LIMIT ?"
-    params.append(limit)
-    rows = conn.execute(query, params).fetchall()
-    conn.close()
-    return rows
-
-
-# ---------------------------------------------------------------------------
-# HTML
-# ---------------------------------------------------------------------------
-
-DASHBOARD_HTML = """<!DOCTYPE html>
-<html lang="en">
+PAGE_TEMPLATE = """<!DOCTYPE html>
+<html>
 <head>
 <meta charset="utf-8">
 <meta http-equiv="refresh" content="5">
-<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Process Monitor</title>
 <style>
-  :root {
-    --bg: #0b0e14;
-    --surface: #141820;
-    --surface2: #1a1f2b;
-    --border: #262d3a;
-    --text: #e2e8f0;
-    --text-dim: #7b879a;
-    --accent: #3b82f6;
-    --green: #22c55e;
-    --yellow: #eab308;
-    --red: #ef4444;
-    --orange: #f97316;
-    --radius: 10px;
-  }
-  * { margin: 0; padding: 0; box-sizing: border-box; }
-  body {
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-    background: var(--bg); color: var(--text);
-    line-height: 1.5; min-height: 100vh;
-  }
-  .container { max-width: 1400px; margin: 0 auto; padding: 24px 32px; }
-
-  /* Header */
-  .header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 28px; }
-  .header h1 { font-size: 22px; font-weight: 700; letter-spacing: -0.3px; }
-  .header h1 span { color: var(--accent); }
-  .live-badge {
-    display: inline-flex; align-items: center; gap: 6px;
-    font-size: 12px; color: var(--green); font-weight: 500;
-    background: rgba(34,197,94,0.1); padding: 4px 12px; border-radius: 20px;
-  }
-  .live-badge::before {
-    content: ''; width: 7px; height: 7px; border-radius: 50%;
-    background: var(--green); animation: pulse 2s infinite;
-  }
-  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
-
-  /* Stats cards */
-  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 14px; margin-bottom: 28px; }
-  .stat-card {
-    background: var(--surface); border: 1px solid var(--border);
-    border-radius: var(--radius); padding: 18px 20px;
-    transition: border-color 0.15s;
-  }
-  .stat-card:hover { border-color: #3a4355; }
-  .stat-card .label { font-size: 12px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.5px; font-weight: 500; }
-  .stat-card .value { font-size: 28px; font-weight: 700; margin-top: 4px; }
-  .stat-card .value.accent { color: var(--accent); }
-  .stat-card .value.red { color: var(--red); }
-  .stat-card .value.yellow { color: var(--yellow); }
-  .stat-card .value.green { color: var(--green); }
-  .stat-card .value.orange { color: var(--orange); }
-
-  /* Toolbar */
-  .toolbar {
-    display: flex; align-items: center; gap: 10px; margin-bottom: 18px; flex-wrap: wrap;
-  }
-  .filter-btn {
-    background: var(--surface); border: 1px solid var(--border);
-    color: var(--text-dim); padding: 6px 14px; border-radius: 6px;
-    font-size: 13px; cursor: pointer; transition: all 0.15s; font-weight: 500;
-  }
-  .filter-btn:hover { border-color: #3a4355; color: var(--text); }
-  .filter-btn.active { background: var(--accent); border-color: var(--accent); color: #fff; }
-  .search-box {
-    flex: 1; min-width: 220px; background: var(--surface); border: 1px solid var(--border);
-    color: var(--text); padding: 7px 14px; border-radius: 6px;
-    font-size: 13px; outline: none; transition: border-color 0.15s;
-  }
-  .search-box::placeholder { color: var(--text-dim); }
-  .search-box:focus { border-color: var(--accent); }
-
-  /* Table */
-  .table-wrap {
-    background: var(--surface); border: 1px solid var(--border);
-    border-radius: var(--radius); overflow: hidden;
-  }
-  table { width: 100%; border-collapse: collapse; font-size: 13px; }
-  thead th {
-    text-align: left; padding: 12px 14px; font-size: 11px; font-weight: 600;
-    color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.4px;
-    background: var(--surface2); border-bottom: 1px solid var(--border);
-    position: sticky; top: 0; cursor: pointer; user-select: none;
-  }
-  thead th:hover { color: var(--text); }
-  tbody td {
-    padding: 10px 14px; border-bottom: 1px solid var(--border);
-    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 300px;
-  }
-  tbody tr { transition: background 0.1s; }
-  tbody tr:hover { background: rgba(59,130,246,0.06); }
-  tbody tr.malicious { background: rgba(239,68,68,0.08); }
-  tbody tr.malicious:hover { background: rgba(239,68,68,0.14); }
-  tbody tr.suspicious { background: rgba(234,179,8,0.07); }
-  tbody tr.suspicious:hover { background: rgba(234,179,8,0.12); }
-
-  /* Badges */
-  .badge {
-    display: inline-block; padding: 2px 8px; border-radius: 4px;
-    font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.3px;
-  }
-  .badge.malicious { background: rgba(239,68,68,0.2); color: var(--red); }
-  .badge.suspicious { background: rgba(234,179,8,0.2); color: var(--yellow); }
-  .badge.benign { background: rgba(123,135,154,0.15); color: var(--text-dim); }
-  .badge.error { background: rgba(249,115,22,0.2); color: var(--orange); }
-
-  .empty { color: var(--text-dim); font-style: italic; padding: 32px 20px; text-align: center; }
-  .conf { color: var(--text-dim); font-variant-numeric: tabular-nums; }
-  .cmd { color: var(--text-dim); font-family: 'SF Mono', 'Cascadia Code', Consolas, monospace; font-size: 12px; }
+  body {{ font-family: -apple-system, Segoe UI, sans-serif; background: #0f1117; color: #e6e6e6; margin: 0; padding: 24px; }}
+  h1 {{ font-size: 20px; }}
+  h2 {{ font-size: 15px; color: #9aa0ac; margin-top: 32px; }}
+  table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
+  th, td {{ text-align: left; padding: 6px 10px; border-bottom: 1px solid #262a35; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 320px; }}
+  th {{ color: #9aa0ac; font-weight: 500; }}
+  tr.malicious {{ background: rgba(220, 60, 60, 0.18); }}
+  tr.suspicious {{ background: rgba(220, 170, 40, 0.14); }}
+  tr.pending {{ background: rgba(220, 170, 40, 0.28); }}
+  .badge {{ padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; }}
+  .badge.malicious {{ background: #dc3c3c; color: white; }}
+  .badge.suspicious {{ background: #dcaa28; color: #1a1a1a; }}
+  .badge.benign {{ background: #2a2f3a; color: #9aa0ac; }}
+  .badge.error {{ background: #555; color: white; }}
+  .empty {{ color: #6b7280; font-style: italic; padding: 12px 0; }}
+  .btn {{ display: inline-block; padding: 4px 10px; border-radius: 4px; text-decoration: none; font-size: 12px; font-weight: 600; margin-right: 6px; }}
+  .btn.block {{ background: #dc3c3c; color: white; }}
+  .btn.dismiss {{ background: #2a2f3a; color: #e6e6e6; }}
+  .banner {{ background: rgba(220, 170, 40, 0.15); border: 1px solid #dcaa28; border-radius: 6px; padding: 10px 14px; margin-bottom: 12px; font-size: 13px; }}
 </style>
 </head>
 <body>
-<div class="container">
-  <div class="header">
-    <h1>&#x1f6e1;&#xfe0f; Process <span>Monitor</span></h1>
-    <div class="live-badge">LIVE</div>
-  </div>
-
-  <div class="stats" id="stats">
-    <div class="stat-card"><div class="label">Total Events</div><div class="value accent" id="s-total">-</div></div>
-    <div class="stat-card"><div class="label">Alerts</div><div class="value red" id="s-alerts">-</div></div>
-    <div class="stat-card"><div class="label">Suspicious</div><div class="value yellow" id="s-suspicious">-</div></div>
-    <div class="stat-card"><div class="label">Malicious</div><div class="value red" id="s-malicious">-</div></div>
-    <div class="stat-card"><div class="label">Benign</div><div class="value green" id="s-benign">-</div></div>
-    <div class="stat-card"><div class="label">Classified</div><div class="value accent" id="s-classified">-</div></div>
-  </div>
-
-  <div class="toolbar">
-    <button class="filter-btn active" data-filter="all">All</button>
-    <button class="filter-btn" data-filter="alerts">Alerts</button>
-    <button class="filter-btn" data-filter="malicious">Malicious</button>
-    <button class="filter-btn" data-filter="suspicious">Suspicious</button>
-    <button class="filter-btn" data-filter="benign">Benign</button>
-    <button class="filter-btn" data-filter="error">Errors</button>
-    <input class="search-box" id="search" type="text" placeholder="Search process name, path, or command line...">
-  </div>
-
-  <div class="table-wrap">
-    <table>
-      <thead>
-        <tr>
-          <th>Time (UTC)</th>
-          <th>Risk</th>
-          <th>Name</th>
-          <th>Path</th>
-          <th>Command Line</th>
-          <th>Parent</th>
-          <th>Reason</th>
-          <th>Conf.</th>
-        </tr>
-      </thead>
-      <tbody id="tbody"></tbody>
-    </table>
-    <div class="empty" id="empty-state">No events yet &mdash; start monitor.py first.</div>
-  </div>
-</div>
-
-<script>
-let allRows = [];
-let currentFilter = 'all';
-let currentSearch = '';
-
-function esc(s) {
-  if (s == null) return '';
-  const d = document.createElement('div');
-  d.textContent = String(s);
-  return d.innerHTML;
-}
-
-function renderTable() {
-  const tbody = document.getElementById('tbody');
-  const empty = document.getElementById('empty-state');
-  let filtered = allRows;
-
-  if (currentFilter !== 'all') {
-    if (currentFilter === 'alerts') {
-      filtered = filtered.filter(r => r.risk === 'suspicious' || r.risk === 'malicious');
-    } else {
-      filtered = filtered.filter(r => r.risk === currentFilter);
-    }
-  }
-
-  if (currentSearch) {
-    const q = currentSearch.toLowerCase();
-    filtered = filtered.filter(r =>
-      (r.name || '').toLowerCase().includes(q) ||
-      (r.path || '').toLowerCase().includes(q) ||
-      (r.command_line || '').toLowerCase().includes(q)
-    );
-  }
-
-  if (filtered.length === 0) {
-    tbody.innerHTML = '';
-    empty.style.display = 'block';
-    return;
-  }
-  empty.style.display = 'none';
-
-  tbody.innerHTML = filtered.map(r => {
-    const cls = (r.risk === 'malicious' || r.risk === 'suspicious') ? r.risk : '';
-    const badgeCls = r.risk || 'benign';
-    const confTxt = r.confidence != null ? Math.round(r.confidence * 100) + '%' : '-';
-    const ts = (r.ts || '').slice(0, 19).replace('T', ' ');
-    return `<tr class="${cls}">
-      <td>${esc(ts)}</td>
-      <td><span class="badge ${badgeCls}">${esc(r.risk || '-')}</span></td>
-      <td>${esc(r.name)}</td>
-      <td title="${esc(r.path)}">${esc(r.path)}</td>
-      <td class="cmd" title="${esc(r.command_line)}">${esc(r.command_line)}</td>
-      <td>${esc(r.parent_name)} (${esc(r.parent_pid)})</td>
-      <td>${esc(r.reason)}</td>
-      <td class="conf">${confTxt}</td>
-    </tr>`;
-  }).join('');
-}
-
-function updateStats(s) {
-  document.getElementById('s-total').textContent = s.total;
-  document.getElementById('s-alerts').textContent = s.alerts;
-  document.getElementById('s-suspicious').textContent = s.suspicious;
-  document.getElementById('s-malicious').textContent = s.malicious;
-  document.getElementById('s-benign').textContent = s.benign;
-  document.getElementById('s-classified').textContent = s.classified;
-}
-
-async function refresh() {
-  try {
-    const params = new URLSearchParams();
-    if (currentFilter !== 'all') params.set('risk', currentFilter);
-    if (currentSearch) params.set('q', currentSearch);
-    params.set('limit', '500');
-    const [statsRes, eventsRes] = await Promise.all([
-      fetch('/api/stats'),
-      fetch('/api/events?' + params.toString()),
-    ]);
-    const stats = await statsRes.json();
-    const events = await eventsRes.json();
-    updateStats(stats);
-    allRows = events;
-    renderTable();
-  } catch (e) {
-    console.error('refresh failed', e);
-  }
-}
-
-// Filter buttons
-document.querySelectorAll('.filter-btn').forEach(btn => {
-  btn.addEventListener('click', () => {
-    document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
-    btn.classList.add('active');
-    currentFilter = btn.dataset.filter;
-    refresh();
-  });
-});
-
-// Search
-let searchTimer;
-document.getElementById('search').addEventListener('input', e => {
-  clearTimeout(searchTimer);
-  searchTimer = setTimeout(() => {
-    currentSearch = e.target.value.trim();
-    refresh();
-  }, 250);
-});
-
-// Initial load + auto-refresh
-refresh();
-setInterval(refresh, 5000);
-</script>
+  <h1>Process Monitor</h1>
+  <h2>Pending approval</h2>
+  {pending_section}
+  <h2>Recent alerts (suspicious / malicious)</h2>
+  {alerts_table}
+  <h2>All events (last 200)</h2>
+  {events_table}
 </body>
 </html>
 """
 
+DECISION_PAGE = """<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta http-equiv="refresh" content="1;url=/">
+<title>Recorded</title>
+<style>body{{font-family:sans-serif;background:#0f1117;color:#e6e6e6;padding:40px;}}</style>
+</head><body>{message} Redirecting back to the dashboard...</body></html>
+"""
 
-# ---------------------------------------------------------------------------
-# HTTP handler
-# ---------------------------------------------------------------------------
+
+# Columns the current code expects that a database created by an older
+# monitor.py doesn't have yet. Add them in place (existing rows are kept)
+# so an old events.db doesn't crash every page load with "no such column".
+ADDED_COLUMNS = (
+    ("suggested_action", "TEXT"),
+    ("action_taken", "TEXT"),
+    ("confirmation_status", "TEXT DEFAULT 'none'"),
+    ("user_decision", "TEXT"),
+)
+
+
+def open_db():
+    """Open events.db and bring an old schema up to date (see ADDED_COLUMNS)."""
+    conn = sqlite3.connect(DB_PATH)
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(events)")}
+    if existing:  # table exists; otherwise let the caller's query report it
+        for col, decl in ADDED_COLUMNS:
+            if col not in existing:
+                conn.execute(f"ALTER TABLE events ADD COLUMN {col} {decl}")
+        conn.commit()
+    return conn
+
+
+def esc(v):
+    return html.escape(str(v)) if v is not None else ""
+
+
+def render_rows(rows):
+    out = []
+    for r in rows:
+        (_id, ts, pid, name, path, cmd, pname, ppid, risk, reason, conf,
+         suggested_action, action_taken, confirmation_status, user_decision,
+         classified) = r
+        cls = risk if risk in ("malicious", "suspicious") else ""
+        badge_cls = risk or "benign"
+        conf_txt = f"{conf:.0%}" if conf is not None else "-"
+        status = action_taken or confirmation_status or "-"
+        out.append(
+            f"<tr class='{cls}'>"
+            f"<td>{esc(ts)[:19]}</td>"
+            f"<td><span class='badge {badge_cls}'>{esc(risk or '-')}</span></td>"
+            f"<td>{esc(name)}</td>"
+            f"<td title='{esc(path)}'>{esc(path)}</td>"
+            f"<td title='{esc(cmd)}'>{esc(cmd)}</td>"
+            f"<td>{esc(pname)} ({esc(ppid)})</td>"
+            f"<td>{esc(reason)}</td>"
+            f"<td>{conf_txt}</td>"
+            f"<td>{esc(status)}</td>"
+            f"</tr>"
+        )
+    return "".join(out)
+
+
+def build_table(rows, headers):
+    if not rows:
+        return "<div class='empty'>No events yet.</div>"
+    head = "".join(f"<th>{h}</th>" for h in headers)
+    return f"<table><tr>{head}</tr>{render_rows(rows)}</table>"
+
+
+def render_pending(rows):
+    if not rows:
+        return "<div class='empty'>Nothing waiting on you right now.</div>"
+    parts = ["<div class='banner'>These processes were flagged by Jev as "
+             "likely malicious but confidence wasn't high enough to "
+             "auto-block (or the process is on the protected list). "
+             "Choose Block to terminate it now, or Dismiss to leave it running.</div>"]
+    for (row_id, ts, pid, name, path, cmd, pname, ppid, risk, reason, conf,
+         suggested_action, action_taken, confirmation_status, user_decision,
+         classified) in rows:
+        conf_txt = f"{conf:.0%}" if conf is not None else "n/a"
+        parts.append(
+            f"<table><tr>"
+            f"<td><b>{esc(name)}</b> (pid {esc(pid)})</td>"
+            f"<td>{esc(path)}</td>"
+            f"<td>reason: {esc(reason)}, confidence: {conf_txt}</td>"
+            f"<td>"
+            f"<a class='btn block' href='/decide?id={row_id}&decision=block'>Block</a>"
+            f"<a class='btn dismiss' href='/decide?id={row_id}&decision=ignore'>Dismiss</a>"
+            f"</td>"
+            f"</tr></table>"
+        )
+    return "".join(parts)
+
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):
-        pass
-
-    def _send(self, status, content_type, body_bytes):
-        self.send_response(status)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(body_bytes)))
-        self.send_header("Cache-Control", "no-cache")
-        self.end_headers()
-        self.wfile.write(body_bytes)
+        pass  # keep console quiet
 
     def do_GET(self):
-        parsed = urlparse(self.path)
-        path = parsed.path
-        qs = parse_qs(parsed.query)
+        parsed = urllib.parse.urlparse(self.path)
 
-        if path in ("/", "/index.html"):
-            self._send(200, "text/html; charset=utf-8",
-                        DASHBOARD_HTML.encode("utf-8"))
+        if parsed.path == "/decide":
+            self.handle_decide(parsed)
+            return
 
-        elif path == "/api/stats":
-            data = get_stats()
-            self._send(200, "application/json",
-                        json.dumps(data).encode("utf-8"))
+        if parsed.path not in ("/", "/index.html"):
+            self.send_response(404)
+            self.end_headers()
+            return
 
-        elif path == "/api/events":
-            limit = int(qs.get("limit", ["500"])[0])
-            risk = qs.get("risk", [None])[0]
-            search = qs.get("q", [None])[0]
-            events = get_events(limit=limit, risk=risk, search=search)
-            rows = []
-            for r in events:
-                (_id, ts, pid, name, pth, cmd, pname, ppid,
-                 risk_val, reason, conf, classified) = r
-                rows.append({
-                    "id": _id, "ts": ts, "pid": pid, "name": name,
-                    "path": pth, "command_line": cmd,
-                    "parent_name": pname, "parent_pid": ppid,
-                    "risk": risk_val, "reason": reason,
-                    "confidence": conf, "classified": classified,
-                })
-            self._send(200, "application/json",
-                        json.dumps(rows).encode("utf-8"))
+        headers = ["Time (UTC)", "Risk", "Name", "Path", "Command line",
+                   "Parent", "Reason", "Conf.", "Status"]
 
+        if not os.path.exists(DB_PATH):
+            empty = "<div class='empty'>events.db not found yet - start monitor.py first.</div>"
+            pending_html = alerts_html = events_html = empty
         else:
-            self._send(404, "text/plain", b"Not found")
+            conn = open_db()
+            pending = conn.execute(
+                "SELECT * FROM events WHERE confirmation_status = 'pending' "
+                "ORDER BY id DESC"
+            ).fetchall()
+            alerts = conn.execute(
+                """SELECT * FROM events WHERE risk IN ('suspicious','malicious')
+                   ORDER BY id DESC LIMIT 100"""
+            ).fetchall()
+            events = conn.execute(
+                "SELECT * FROM events ORDER BY id DESC LIMIT 200"
+            ).fetchall()
+            conn.close()
+            pending_html = render_pending(pending)
+            alerts_html = build_table(alerts, headers)
+            events_html = build_table(events, headers)
 
+        page = PAGE_TEMPLATE.format(
+            pending_section=pending_html,
+            alerts_table=alerts_html,
+            events_table=events_html,
+        )
+        self._send_html(page)
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+    def handle_decide(self, parsed):
+        qs = urllib.parse.parse_qs(parsed.query)
+        row_id = qs.get("id", [None])[0]
+        decision = qs.get("decision", [None])[0]
+
+        if decision not in ("block", "ignore") or not row_id or not row_id.isdigit():
+            self._send_html(DECISION_PAGE.format(message="Invalid request."), code=400)
+            return
+
+        if not os.path.exists(DB_PATH):
+            self._send_html(DECISION_PAGE.format(message="No events database found."), code=404)
+            return
+
+        conn = open_db()
+        conn.execute(
+            "UPDATE events SET user_decision = ? "
+            "WHERE id = ? AND confirmation_status = 'pending'",
+            (decision, row_id),
+        )
+        conn.commit()
+        conn.close()
+
+        verb = "Block" if decision == "block" else "Dismiss"
+        self._send_html(DECISION_PAGE.format(
+            message=f"{verb} recorded - monitor.py will act on it shortly."
+        ))
+
+    def _send_html(self, page, code=200):
+        body = page.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
 
 def main():
-    # Auto-start monitor.py in background if not already running
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    monitor_script = os.path.join(script_dir, "monitor.py")
-    monitor_proc = None
-    if os.path.exists(monitor_script):
-        try:
-            monitor_proc = subprocess.Popen(
-                [sys.executable, monitor_script],
-                cwd=script_dir,
-            )
-            print(f"Started monitor.py (pid {monitor_proc.pid})")
-        except Exception as e:
-            print(f"Warning: could not start monitor.py: {e}")
     print(f"Dashboard running at http://127.0.0.1:{PORT}  (Ctrl+C to stop)")
-    try:
-        HTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
-    finally:
-        if monitor_proc and monitor_proc.poll() is None:
-            print("Stopping monitor.py...")
-            monitor_proc.terminate()
-            try:
-                monitor_proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                monitor_proc.kill()
+    HTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
 
 
 if __name__ == "__main__":
