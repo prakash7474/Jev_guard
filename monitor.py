@@ -114,6 +114,22 @@ ADDED_COLUMNS = (
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
+    # One row per Jev API call - powers the usage/cost section of the
+    # dashboard. CREATE IF NOT EXISTS also covers an events.db created by an
+    # older version that predates this table.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS jev_usage (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT NOT NULL,
+            event_id INTEGER,
+            model TEXT,
+            status TEXT,
+            input_tokens INTEGER,
+            output_tokens INTEGER,
+            latency_ms INTEGER,
+            error TEXT
+        )
+    """)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -138,8 +154,44 @@ def init_db():
     for col, decl in ADDED_COLUMNS:
         if col not in existing:
             conn.execute(f"ALTER TABLE events ADD COLUMN {col} {decl}")
+    # Processes the user marked trusted from the dashboard's Allow button.
+    # Matching launches skip the Jev call entirely (see is_allowlisted).
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS allowlist (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT NOT NULL,
+            name TEXT NOT NULL,
+            path TEXT
+        )
+    """)
+    # Small key/value store - currently just the monitor's last heartbeat,
+    # which the dashboard reads to tell whether decisions you record will
+    # actually get applied (see heartbeat() below).
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS meta (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
     conn.commit()
     return conn
+
+
+def log_usage(conn, event_id, status, latency_ms, input_tokens=None,
+              output_tokens=None, error=None):
+    """Record one Jev API call (for the dashboard's usage/cost section)."""
+    conn.execute(
+        """INSERT INTO jev_usage
+           (ts, event_id, model, status, input_tokens, output_tokens,
+            latency_ms, error)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            datetime.now(timezone.utc).isoformat(),
+            event_id, JEV_MODEL, status, input_tokens, output_tokens,
+            latency_ms, error,
+        ),
+    )
+    conn.commit()
 
 
 def log_event(conn, info, risk=None, reason=None, confidence=None,
@@ -161,6 +213,17 @@ def log_event(conn, info, risk=None, reason=None, confidence=None,
     )
     conn.commit()
     return cur.lastrowid
+
+
+def heartbeat(conn):
+    """Stamp that the monitor loop is alive. The dashboard shows a warning
+    when this goes stale, so 'I clicked Block and nothing happened' is
+    immediately distinguishable from 'monitor.py isn't running'."""
+    conn.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES ('last_seen', ?)",
+        (datetime.now(timezone.utc).isoformat(),),
+    )
+    conn.commit()
 
 
 def poll_user_decisions(conn, wmi_conn):
@@ -235,13 +298,33 @@ def is_known_safe(info):
     return True
 
 
+def is_allowlisted(conn, info):
+    """True if this process was marked trusted from the dashboard's Allow
+    button, so we skip the Jev call entirely. Matching is case-insensitive
+    on the executable name; an entry with a blank path matches any path.
+    The allowlist is re-read each call so entries added from the dashboard
+    take effect without restarting the monitor."""
+    name = (info["name"] or "").strip().lower()
+    if not name:
+        return False
+    path = (info["path"] or "").strip().lower()
+    for a_name, a_path in conn.execute("SELECT name, path FROM allowlist"):
+        if (a_name or "").strip().lower() != name:
+            continue
+        a_path = (a_path or "").strip().lower()
+        if not a_path or a_path == path:
+            return True
+    return False
+
+
 # --------------------------------------------------------------------------
 # Jev classification
 # --------------------------------------------------------------------------
 
 def classify_process(info):
     """Ask Jev whether this process launch looks suspicious and what to do
-    about it. Returns (risk, reason, suggested_action, confidence)."""
+    about it. Returns (risk, reason, suggested_action, confidence, usage)
+    where usage is the API-reported token usage (may be empty)."""
     if not TYPESAFE_API_KEY:
         raise RuntimeError("TYPESAFE_API_KEY environment variable is not set")
 
@@ -328,11 +411,13 @@ def classify_process(info):
     risk_ans = data["answers"]["risk"]
     reason_ans = data["answers"]["reason"]
     action_ans = data["answers"]["action"]
+    usage = data.get("usage") or {}
     return (
         risk_ans["choice"],
         reason_ans["choice"],
         action_ans["choice"],
         risk_ans.get("confidence"),
+        usage,
     )
 
 
@@ -465,12 +550,20 @@ def main():
 
     while True:
         try:
+            # Every pass: refresh the heartbeat and apply any Block/Dismiss/
+            # Allow decisions made in the dashboard. This used to run only
+            # when the watcher idle-timed out (no new process for 1s) - on a
+            # busy machine that branch could go minutes without firing, so
+            # recorded decisions sat unapplied and the dashboard buttons
+            # looked broken.
+            heartbeat(conn)
+            poll_user_decisions(conn, c)
+
             try:
                 new_proc = watcher(timeout_ms=1000)
             except wmi.x_wmi_timed_out:
-                # No new process in the last second - use the idle moment to
-                # check whether you've approved/dismissed anything pending.
-                poll_user_decisions(conn, c)
+                # No new process in the last second - loop around and check
+                # for decisions again.
                 continue
 
             info = get_process_info(c, new_proc)
@@ -480,13 +573,24 @@ def main():
                            classified=0)
                 continue
 
-            try:
-                risk, reason, suggested_action, confidence = classify_process(info)
-            except Exception as e:
-                print(f"[classify error] {info['name']} (pid {info['pid']}): {e}")
-                log_event(conn, info, risk="error", reason=str(e)[:200],
-                           classified=0)
+            if is_allowlisted(conn, info):
+                log_event(conn, info, risk="benign",
+                           reason="allowlisted_skip", classified=0)
                 continue
+
+            call_start = time.perf_counter()
+            try:
+                risk, reason, suggested_action, confidence, usage = \
+                    classify_process(info)
+            except Exception as e:
+                latency_ms = int((time.perf_counter() - call_start) * 1000)
+                print(f"[classify error] {info['name']} (pid {info['pid']}): {e}")
+                row_id = log_event(conn, info, risk="error",
+                                   reason=str(e)[:200], classified=0)
+                log_usage(conn, row_id, status="error",
+                          latency_ms=latency_ms, error=str(e)[:300])
+                continue
+            latency_ms = int((time.perf_counter() - call_start) * 1000)
 
             # Decide + (maybe) terminate - one function, also unit-tested.
             action_taken, confirmation_status = resolve_action(
@@ -496,6 +600,11 @@ def main():
                 conn, info, risk=risk, reason=reason, confidence=confidence,
                 suggested_action=suggested_action, action_taken=action_taken,
                 confirmation_status=confirmation_status, classified=1,
+            )
+            log_usage(
+                conn, row_id, status="ok", latency_ms=latency_ms,
+                input_tokens=usage.get("input_tokens"),
+                output_tokens=usage.get("output_tokens"),
             )
 
             if should_notify(risk, confidence):
